@@ -137,3 +137,4 @@ async def test_discover_journalists_uses_searxng_dorking(
         assert discovered[0].email == "maya.lin@techcrunch.com"
     finally:
         get_settings.cache_clear()
+

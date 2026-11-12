@@ -83,3 +83,4 @@ async def dispatch_pitch_email(
     raise MailDispatchError(
         f"MAIL_PROVIDER='{provider}' is not configured with OAuth credentials in this environment."
     )
+

@@ -175,3 +175,4 @@ async def test_resend_mailer_and_daily_cap(
             await approve_and_send_pitch(db_session, pitch=pitch1, approver=officer)
     finally:
         get_settings.cache_clear()
+
