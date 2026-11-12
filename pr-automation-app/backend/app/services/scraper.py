@@ -222,6 +222,38 @@ class RobotsChecker:
         return bool(parser.can_fetch(url, self.user_agent))
 
 
+async def smart_fetch_html(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    user_agent: str,
+    allow_stealth_fallback: bool = True,
+) -> tuple[int, str, str]:
+    """Fetch HTML via httpx, falling back to curl_cffi Chrome TLS impersonation on 403/429."""
+    resp = await client.get(url, headers={"User-Agent": user_agent})
+    if resp.status_code == 200 or not allow_stealth_fallback:
+        return resp.status_code, str(resp.url), resp.text
+
+    if resp.status_code in (403, 429):
+        try:
+            from curl_cffi.requests import AsyncSession  # type: ignore[import-untyped]
+
+            async with AsyncSession(impersonate="chrome", timeout=12) as session:
+                stealth_resp = await session.get(
+                    url,
+                    headers={"User-Agent": user_agent},
+                    allow_redirects=True,
+                )
+            status_code = int(getattr(stealth_resp, "status_code", 0) or 0)
+            body = getattr(stealth_resp, "text", "") or ""
+            final_url = str(getattr(stealth_resp, "url", url) or url)
+            if status_code == 200 and body:
+                return 200, final_url, body
+        except Exception:
+            pass
+    return resp.status_code, str(resp.url), resp.text
+
+
 def _classify_social_url(href: str) -> str | None:
     lower = href.lower()
     if "linkedin.com/in/" in lower:

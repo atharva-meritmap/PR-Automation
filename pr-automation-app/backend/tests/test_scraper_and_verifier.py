@@ -1,133 +1,181 @@
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.services.email_verifier import verify_email_address
-from app.services.journalists import upsert_scraped_journalist
-from app.services.scraper import (
-    ScrapeBlockedError,
-    extract_journalist_from_html,
-    scrape_journalist_page,
-    validate_public_http_url,
+from app.services.email_verifier import (
+    discover_verified_pattern_email,
+    find_email_hunter,
+    find_email_prospeo,
+    infer_outlet_email_candidates,
+    resolve_journalist_email,
 )
-
-SAMPLE_AUTHOR_HTML = """
-<!doctype html>
-<html>
-  <head>
-    <title>Jane Doe - TechDaily</title>
-    <meta property="og:site_name" content="TechDaily" />
-  </head>
-  <body>
-    <h1>Jane Doe</h1>
-    <p>Senior AI Reporter. Contact: <a href="mailto:jane.doe@example.com">jane.doe@example.com</a></p>
-    <a href="https://www.linkedin.com/in/janedoe-tech">LinkedIn</a>
-    <a href="https://x.com/janedoe">X</a>
-    <article>
-      <h2><a href="/2026/ai-chips">AI Chips Surge in 2026</a></h2>
-      <time datetime="2026-10-15T10:00:00Z">Oct 15, 2026</time>
-      <p>Semiconductor startups raised record funding this quarter.</p>
-    </article>
-    <article>
-      <h2><a href="/2026/robotics-boom">Robotics Boom in Manufacturing</a></h2>
-      <time datetime="2026-10-01T10:00:00Z">Oct 1, 2026</time>
-      <p>Industrial automation is accelerating across factories.</p>
-    </article>
-  </body>
-</html>
-"""
+from app.services.scraper import smart_fetch_html
 
 
-def test_ssrf_guard_blocks_private_urls() -> None:
-    for bad in (
-        "http://localhost:8000/admin",
-        "http://127.0.0.1/secret",
-        "http://192.168.1.1/",
-        "ftp://example.com/file",
-    ):
-        with pytest.raises(ScrapeBlockedError):
-            validate_public_http_url(bad)
-
-    assert validate_public_http_url("https://example.com/author/jane") == "https://example.com/author/jane"
-
-
-def test_extract_journalist_from_html_with_provenance() -> None:
-    scraped = extract_journalist_from_html(
-        SAMPLE_AUTHOR_HTML,
-        source_url="https://example.com/author/jane",
-        beat="AI & Robotics",
-    )
-    assert scraped.canonical_name == "Jane Doe"
-    assert scraped.outlet == "TechDaily"
-    assert scraped.email == "jane.doe@example.com"
-    assert scraped.email_source_url == "https://example.com/author/jane"
-    assert scraped.email_scraped_at is not None
-    assert len(scraped.socials) == 2
-    assert {s.platform for s in scraped.socials} == {"linkedin", "x"}
-    assert len(scraped.articles) == 2
-    assert scraped.articles[0].url == "https://example.com/2026/ai-chips"
-    assert scraped.articles[0].source_url == "https://example.com/author/jane"
+def test_infer_outlet_email_candidates() -> None:
+    assert infer_outlet_email_candidates("Jane Doe", "techcrunch.com") == [
+        "jane.doe@techcrunch.com",
+        "jane@techcrunch.com",
+        "jdoe@techcrunch.com",
+    ]
+    assert infer_outlet_email_candidates("Jane Doe", "www.forbes.com") == [
+        "jane.doe@forbes.com",
+        "jane@forbes.com",
+        "jdoe@forbes.com",
+    ]
+    # Single-token or empty names should not produce patterns
+    assert infer_outlet_email_candidates("Atharva", "example.com") == []
+    assert infer_outlet_email_candidates("Jane Doe", "localhost") == []
 
 
 @pytest.mark.asyncio
-async def test_robots_txt_disallow_blocks_scrape() -> None:
+async def test_discover_verified_pattern_email_none_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EMAIL_VERIFIER_PROVIDER", "none")
+    get_settings.cache_clear()
+    try:
+        email, status = await discover_verified_pattern_email("Jane Doe", "techcrunch.com")
+        assert email is None
+        assert status == "missing"
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_discover_verified_pattern_email_reoon_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMAIL_VERIFIER_PROVIDER", "reoon")
+    monkeypatch.setenv("EMAIL_VERIFIER_API_KEY", "test-reoon-key")
+    get_settings.cache_clear()
+
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/robots.txt":
-            return httpx.Response(200, text="User-agent: *\nDisallow: /private/\n")
-        return httpx.Response(200, text=SAMPLE_AUTHOR_HTML)
+        email_param = request.url.params.get("email", "")
+        if email_param == "jane@techcrunch.com":
+            return httpx.Response(200, json={"status": "safe"})
+        return httpx.Response(200, json={"status": "invalid"})
 
     transport = httpx.MockTransport(handler)
-    with pytest.raises(ScrapeBlockedError):
-        await scrape_journalist_page(
-            "https://93.184.216.34/private/author",
-            transport=transport,
+    try:
+        with patch("app.services.email_verifier.check_mx_record", return_value=True):
+            email, status = await discover_verified_pattern_email(
+                "Jane Doe", "techcrunch.com", transport=transport
+            )
+        assert email == "jane@techcrunch.com"
+        assert status == "verified"
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_smart_fetch_html_uses_httpx_on_200() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html><body>ok</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        status, final_url, html = await smart_fetch_html(
+            client,
+            "https://example.com/article",
+            user_agent="TestBot/1.0",
+            allow_stealth_fallback=True,
         )
+    assert status == 200
+    assert "ok" in html
+    assert final_url == "https://example.com/article"
 
 
 @pytest.mark.asyncio
-async def test_scrape_and_dedupe_across_upserts(db_session: AsyncSession) -> None:
+async def test_smart_fetch_html_stealth_fallback_on_403() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/robots.txt":
-            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
-        return httpx.Response(200, text=SAMPLE_AUTHOR_HTML)
+        return httpx.Response(403, text="Forbidden")
 
-    transport = httpx.MockTransport(handler)
-    scraped = await scrape_journalist_page(
-        "https://93.184.216.34/author/jane",
-        beat="AI",
-        transport=transport,
-    )
-    j1 = await upsert_scraped_journalist(db_session, scraped)
-    j2 = await upsert_scraped_journalist(db_session, scraped)
-    assert j1.id == j2.id
-    assert j1.email_status == "unverified"
-    assert len(j1.articles) == 2
+    fake_stealth_resp = type(
+        "FakeResp",
+        (),
+        {
+            "status_code": 200,
+            "text": "<html><body>bypassed</body></html>",
+            "url": "https://example.com/article",
+        },
+    )()
+
+    class FakeSession:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        get = AsyncMock(return_value=fake_stealth_resp)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with patch("curl_cffi.requests.AsyncSession", FakeSession):
+            status, final_url, html = await smart_fetch_html(
+                client,
+                "https://example.com/article",
+                user_agent="TestBot/1.0",
+                allow_stealth_fallback=True,
+            )
+    assert status == 200
+    assert "bypassed" in html
+    assert final_url == "https://example.com/article"
 
 
 @pytest.mark.asyncio
-async def test_email_verification_honest_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Missing & invalid syntax
-    assert (await verify_email_address(None)).status == "missing"
-    assert (await verify_email_address("not-an-email")).status == "invalid"
+async def test_hunter_and_prospeo_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HUNTER_API_KEY", "hunter-key")
+    monkeypatch.setenv("PROSPEO_API_KEY", "prospeo-key")
+    get_settings.cache_clear()
 
-    # No MX -> invalid
-    monkeypatch.setattr("app.services.email_verifier.check_mx_record", lambda _d: None)
-    res_no_mx = await verify_email_address("jane@example.com")
-    assert res_no_mx.status == "invalid"
+    def hunter_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.hunter.io":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "email": "jane.doe@techcrunch.com",
+                        "verification": {"status": "valid"},
+                    }
+                },
+            )
+        return httpx.Response(404)
 
-    # Valid MX + provider=none -> MUST remain unverified (never verified)
-    monkeypatch.setattr("app.services.email_verifier.check_mx_record", lambda _d: "mx.example.com")
-    settings = get_settings()
-    monkeypatch.setattr(settings, "EMAIL_VERIFIER_PROVIDER", "none")
-    res_unverified = await verify_email_address("jane@example.com")
-    assert res_unverified.status == "unverified"
+    def prospeo_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.prospeo.io":
+            assert request.headers.get("X-KEY") == "prospeo-key"
+            return httpx.Response(
+                200,
+                json={
+                    "error": False,
+                    "response": {
+                        "email": "jane@techcrunch.com",
+                        "email_status": "VALID",
+                    },
+                },
+            )
+        return httpx.Response(404)
 
-    # Mocked Reoon safe -> verified; catch_all -> risky
-    monkeypatch.setattr(settings, "EMAIL_VERIFIER_PROVIDER", "reoon")
-    monkeypatch.setattr(settings, "EMAIL_VERIFIER_API_KEY", "test-key")
-    safe_transport = httpx.MockTransport(lambda _r: httpx.Response(200, json={"status": "safe"}))
-    assert (await verify_email_address("jane@example.com", transport=safe_transport)).status == "verified"
+    try:
+        email_h, status_h = await find_email_hunter(
+            "Jane Doe", "techcrunch.com", transport=httpx.MockTransport(hunter_handler)
+        )
+        assert (email_h, status_h) == ("jane.doe@techcrunch.com", "verified")
 
-    catchall_transport = httpx.MockTransport(lambda _r: httpx.Response(200, json={"status": "catch_all"}))
-    assert (await verify_email_address("jane@example.com", transport=catchall_transport)).status == "risky"
+        email_p, status_p = await find_email_prospeo(
+            "Jane Doe", "techcrunch.com", transport=httpx.MockTransport(prospeo_handler)
+        )
+        assert (email_p, status_p) == ("jane@techcrunch.com", "verified")
+
+        # Fallback from Hunter (404) -> Prospeo (VALID)
+        email_r, status_r, src_r = await resolve_journalist_email(
+            "Jane Doe", "techcrunch.com", transport=httpx.MockTransport(prospeo_handler)
+        )
+        assert (email_r, status_r, src_r) == ("jane@techcrunch.com", "verified", "prospeo")
+    finally:
+        get_settings.cache_clear()

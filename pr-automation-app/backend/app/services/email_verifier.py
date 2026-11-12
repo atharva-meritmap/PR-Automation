@@ -91,3 +91,167 @@ async def verify_email_address(
         detail="Unsupported verifier provider; kept unverified",
     )
 
+
+_PUBLIC_AGGREGATOR_DOMAINS = (
+    "bing.com",
+    "google.com",
+    "msn.com",
+    "yahoo.com",
+    "gmail.com",
+    "outlook.com",
+    "substack.com",
+    "medium.com",
+)
+
+
+def _split_name_and_domain(full_name: str, outlet_domain: str) -> tuple[str, str, str] | None:
+    domain = outlet_domain.strip().lower().removeprefix("www.")
+    if not domain or "." not in domain or domain in _PUBLIC_AGGREGATOR_DOMAINS:
+        return None
+    parts = [re.sub(r"[^a-z]", "", p.lower()) for p in full_name.split()]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return None
+    first, last = parts[0], parts[-1]
+    if len(first) < 2 or len(last) < 2:
+        return None
+    return first, last, domain
+
+
+def infer_outlet_email_candidates(full_name: str, outlet_domain: str) -> list[str]:
+    """Generate cleanroom corporate email patterns for a journalist at a valid outlet domain."""
+    parsed = _split_name_and_domain(full_name, outlet_domain)
+    if parsed is None:
+        return []
+    first, last, domain = parsed
+    return [
+        f"{first}.{last}@{domain}",
+        f"{first}@{domain}",
+        f"{first[0]}{last}@{domain}",
+    ]
+
+
+async def find_email_hunter(
+    full_name: str,
+    outlet_domain: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[str | None, str]:
+    """Resolve and verify a journalist's corporate email via Hunter.io Email Finder."""
+    settings = get_settings()
+    if not settings.HUNTER_API_KEY:
+        return None, "missing"
+    parsed = _split_name_and_domain(full_name, outlet_domain)
+    if parsed is None:
+        return None, "missing"
+    first, last, domain = parsed
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0), transport=transport) as client:
+            resp = await client.get(
+                "https://api.hunter.io/v2/email-finder",
+                params={
+                    "domain": domain,
+                    "first_name": first,
+                    "last_name": last,
+                    "api_key": settings.HUNTER_API_KEY,
+                },
+            )
+            if resp.status_code != 200:
+                return None, "missing"
+            data = resp.json().get("data") or {}
+            email = str(data.get("email") or "").strip().lower()
+            verif_status = str((data.get("verification") or {}).get("status") or "").lower()
+            if email and verif_status == "valid":
+                return email, "verified"
+    except Exception:
+        return None, "missing"
+    return None, "missing"
+
+
+async def find_email_prospeo(
+    full_name: str,
+    outlet_domain: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[str | None, str]:
+    """Resolve and verify a journalist's corporate email via Prospeo Email Finder."""
+    settings = get_settings()
+    if not settings.PROSPEO_API_KEY:
+        return None, "missing"
+    parsed = _split_name_and_domain(full_name, outlet_domain)
+    if parsed is None:
+        return None, "missing"
+    first, last, domain = parsed
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0), transport=transport) as client:
+            resp = await client.post(
+                "https://api.prospeo.io/email-finder",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-KEY": settings.PROSPEO_API_KEY,
+                },
+                json={"first_name": first, "last_name": last, "company": domain},
+            )
+            if resp.status_code != 200:
+                return None, "missing"
+            payload = resp.json()
+            if payload.get("error"):
+                return None, "missing"
+            inner = payload.get("response") or {}
+            email = str(inner.get("email") or "").strip().lower()
+            status = str(inner.get("email_status") or "").upper()
+            if email and status == "VALID":
+                return email, "verified"
+    except Exception:
+        return None, "missing"
+    return None, "missing"
+
+
+async def discover_verified_pattern_email(
+    full_name: str,
+    outlet_domain: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[str | None, str]:
+    """Only return a pattern email if an external verifier confirms it as 'verified'."""
+    settings = get_settings()
+    if settings.EMAIL_VERIFIER_PROVIDER == "none" or not settings.EMAIL_VERIFIER_API_KEY:
+        return None, "missing"
+
+    candidates = infer_outlet_email_candidates(full_name, outlet_domain)
+    if not candidates or check_mx_record(outlet_domain.strip().lower().removeprefix("www.")) is None:
+        return None, "missing"
+
+    for candidate in candidates:
+        res = await verify_email_address(candidate, transport=transport)
+        if res.status == "verified":
+            return candidate, "verified"
+    return None, "missing"
+
+
+async def resolve_journalist_email(
+    full_name: str,
+    outlet_domain: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[str | None, str, str]:
+    """Resolve a verified journalist email via Hunter -> Prospeo -> MX+Verifier pattern fallback."""
+    email, status = await find_email_hunter(full_name, outlet_domain, transport=transport)
+    if email and status == "verified":
+        return email, "verified", "hunter"
+
+    email, status = await find_email_prospeo(full_name, outlet_domain, transport=transport)
+    if email and status == "verified":
+        return email, "verified", "prospeo"
+
+    email, status = await discover_verified_pattern_email(
+        full_name, outlet_domain, transport=transport
+    )
+    if email and status == "verified":
+        return email, "verified", "verified-pattern"
+
+    return None, "missing", ""
+
+

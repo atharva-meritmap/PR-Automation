@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     OPENROUTER_MODEL: str = "baidu/ernie-5.5-flash-preview:free"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
+    EXA_API_KEY: str = ""
+    TAVILY_API_KEY: str = ""
+    SEARXNG_BASE_URL: str = ""
+    HUNTER_API_KEY: str = ""
+    PROSPEO_API_KEY: str = ""
+
     EMAIL_VERIFIER_PROVIDER: Literal["none", "reoon", "zerobounce"] = "none"
     EMAIL_VERIFIER_API_KEY: str = ""
     SCRAPER_USER_AGENT: str = "PRAutomationBot/1.0 (+https://example.com/bot)"

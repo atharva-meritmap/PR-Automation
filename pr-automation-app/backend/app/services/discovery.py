@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import re
 from datetime import datetime, timezone
@@ -10,6 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.db.models import Client, Journalist
+from app.services.email_verifier import resolve_journalist_email
+from app.services.exa_search import (
+    search_articles_with_authors,
+    search_journalist_bio,
+)
 from app.services.journalists import upsert_scraped_journalist
 from app.services.scraper import (
     _EMAIL_RE,
@@ -17,9 +23,16 @@ from app.services.scraper import (
     RobotsChecker,
     ScrapedArticle,
     ScrapedJournalist,
+    ScrapedSocial,
     _is_usable_email,
     extract_journalist_from_html,
+    smart_fetch_html,
     validate_public_http_url,
+)
+from app.services.searxng_search import dork_journalist_bio_searxng
+from app.services.tavily_search import (
+    search_tavily_articles,
+    search_tavily_bio,
 )
 
 # Public, high-signal publication RSS feeds for tech/AI/business/science PR discovery
@@ -170,12 +183,283 @@ async def discover_journalists_for_client(
         for q in queries
     ]
     pool_limit = max_results + 2
+    allow_stealth = transport is None
+    sem = asyncio.Semaphore(6)
+
+    async def _enrich_article_candidate(
+        http: httpx.AsyncClient,
+        *,
+        art_title: str,
+        art_link: str,
+        outlet: str,
+        author_name: str,
+        rss_email: str | None,
+        summary: str,
+        source_url: str,
+    ) -> tuple[str, ScrapedJournalist] | None:
+        enriched: ScrapedJournalist | None = None
+        art_domain = ""
+        async with sem:
+            try:
+                clean_art_url = validate_public_http_url(art_link)
+                art_domain = urlparse(clean_art_url).netloc.lower()
+                await rate_limiter.acquire(art_domain)
+                if await robots.can_fetch(http, clean_art_url):
+                    art_status, art_final_url, art_html = await smart_fetch_html(
+                        http,
+                        clean_art_url,
+                        user_agent=settings.SCRAPER_USER_AGENT,
+                        allow_stealth_fallback=allow_stealth,
+                    )
+                    if art_status == 200 and art_html:
+                        byline = _extract_byline_from_html(art_html)
+                        if byline:
+                            author_name = byline
+                        parsed_page = extract_journalist_from_html(
+                            art_html,
+                            source_url=art_final_url,
+                            outlet=outlet,
+                            beat=queries[0],
+                        )
+                        if author_name:
+                            parsed_page.canonical_name = author_name
+                        if parsed_page.email is None:
+                            author_url = _find_author_profile_url(art_html, art_final_url)
+                            if author_url:
+                                try:
+                                    clean_auth_url = validate_public_http_url(author_url)
+                                    auth_domain = urlparse(clean_auth_url).netloc.lower()
+                                    await rate_limiter.acquire(auth_domain)
+                                    if await robots.can_fetch(http, clean_auth_url):
+                                        auth_status, auth_final_url, auth_html = await smart_fetch_html(
+                                            http,
+                                            clean_auth_url,
+                                            user_agent=settings.SCRAPER_USER_AGENT,
+                                            allow_stealth_fallback=allow_stealth,
+                                        )
+                                        if auth_status == 200 and auth_html:
+                                            auth_page = extract_journalist_from_html(
+                                                auth_html,
+                                                source_url=auth_final_url,
+                                                outlet=outlet,
+                                                beat=queries[0],
+                                            )
+                                            if auth_page.email:
+                                                parsed_page.email = auth_page.email
+                                                parsed_page.email_source_url = auth_page.email_source_url
+                                                parsed_page.email_scraped_at = auth_page.email_scraped_at
+                                            if not parsed_page.socials and auth_page.socials:
+                                                parsed_page.socials = auth_page.socials
+                                except Exception:
+                                    pass
+                        enriched = parsed_page
+            except Exception:
+                enriched = None
+
+        final_name = (
+            author_name
+            or (enriched.canonical_name if enriched else "")
+        ).strip()
+        if not _is_valid_journalist_name(final_name):
+            return None
+
+        dedupe_key = f"{final_name.lower()}|{outlet.lower()}"
+        article_obj = ScrapedArticle(
+            title=art_title,
+            url=art_link,
+            published_at=None,
+            summary=summary,
+            source_url=source_url,
+            scraped_at=now,
+            content_hash=hashlib.sha256(f"{art_title}|{art_link}".encode()).hexdigest(),
+        )
+
+        if enriched is not None:
+            if enriched.email is None and rss_email is not None:
+                enriched.email = rss_email
+                enriched.email_source_url = source_url
+                enriched.email_scraped_at = now
+            if not any(a.url == art_link for a in enriched.articles):
+                enriched.articles.insert(0, article_obj)
+            candidate = enriched
+        else:
+            candidate = ScrapedJournalist(
+                canonical_name=final_name,
+                outlet=outlet,
+                beat=queries[0],
+                email=rss_email,
+                email_source_url=source_url if rss_email else None,
+                email_scraped_at=now if rss_email else None,
+                profile_source_url=art_link,
+                profile_scraped_at=now,
+                confidence_score=0.75 if rss_email else 0.6,
+                socials=[],
+                articles=[article_obj],
+            )
+
+        def _merge_bio_fields(
+            email: str | None,
+            email_source_url: str | None,
+            socials: list[tuple[str, str]] | None,
+        ) -> None:
+            if candidate.email is None and email:
+                candidate.email = email
+                candidate.email_source_url = email_source_url
+                candidate.email_scraped_at = now
+            if socials:
+                existing_urls = {s.handle_or_url for s in candidate.socials}
+                for platform, social_url in socials:
+                    if social_url not in existing_urls:
+                        existing_urls.add(social_url)
+                        candidate.socials.append(
+                            ScrapedSocial(
+                                platform=platform,
+                                handle_or_url=social_url,
+                                source_url=social_url,
+                                scraped_at=now,
+                            )
+                        )
+
+        # Step 2a: SearXNG OSINT boolean dorking when configured
+        if settings.SEARXNG_BASE_URL and (candidate.email is None or not candidate.socials):
+            sx_bio = await dork_journalist_bio_searxng(
+                final_name,
+                outlet,
+                transport=transport,
+            )
+            _merge_bio_fields(sx_bio.email, sx_bio.email_source_url, sx_bio.socials)
+
+        # Step 2b: Exa bio & social search when email or socials are still missing
+        if settings.EXA_API_KEY and (candidate.email is None or not candidate.socials):
+            bio_hit = await search_journalist_bio(
+                final_name,
+                outlet,
+                transport=transport,
+            )
+            _merge_bio_fields(bio_hit.email, bio_hit.email_source_url, bio_hit.socials)
+
+        # Step 2c: Tavily bio & social search when email or socials are still missing
+        if settings.TAVILY_API_KEY and (candidate.email is None or not candidate.socials):
+            t_bio = await search_tavily_bio(
+                final_name,
+                outlet,
+                transport=transport,
+            )
+            _merge_bio_fields(t_bio.email, t_bio.email_source_url, t_bio.socials)
+
+        # Hunter -> Prospeo -> MX+Verifier pattern fallback (never fabricates unverified emails)
+        if candidate.email is None and art_domain:
+            verified_email, v_status, v_source = await resolve_journalist_email(
+                final_name,
+                art_domain,
+                transport=transport,
+            )
+            if verified_email and v_status == "verified":
+                candidate.email = verified_email
+                candidate.email_source_url = f"{v_source}://{art_domain}"
+                candidate.email_scraped_at = now
+
+        return dedupe_key, candidate
+
+    async def _enrich_entry(
+        http: httpx.AsyncClient,
+        default_outlet: str,
+        rss_url: str,
+        entry: object,
+    ) -> tuple[str, ScrapedJournalist] | None:
+        art_title = str(getattr(entry, "title", "")).strip()
+        raw_link = str(getattr(entry, "link", "")).strip()
+        if not art_title or not raw_link:
+            return None
+        art_link = _unwrap_news_link(raw_link)
+
+        source_meta = getattr(entry, "source", None)
+        outlet = str(
+            getattr(source_meta, "title", "")
+            or (default_outlet if default_outlet != "Bing News" else urlparse(art_link).netloc)
+        ).strip()
+        author_name = str(getattr(entry, "author", "")).strip()
+        rss_email = _extract_rss_email(entry)
+        summary = re.sub(r"<[^>]+>", " ", str(getattr(entry, "summary", ""))).strip()[:400]
+        return await _enrich_article_candidate(
+            http,
+            art_title=art_title,
+            art_link=art_link,
+            outlet=outlet,
+            author_name=author_name,
+            rss_email=rss_email,
+            summary=summary,
+            source_url=rss_url,
+        )
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(6.0),
         follow_redirects=True,
         transport=transport,
     ) as http:
+        if settings.EXA_API_KEY:
+            exa_hits = await search_articles_with_authors(
+                queries[0],
+                transport=transport,
+            )
+            if exa_hits:
+                exa_results = await asyncio.gather(
+                    *(
+                        _enrich_article_candidate(
+                            http,
+                            art_title=hit.title,
+                            art_link=hit.url,
+                            outlet=hit.outlet,
+                            author_name=hit.author,
+                            rss_email=None,
+                            summary=" ".join(hit.highlights)[:400],
+                            source_url="https://api.exa.ai/search",
+                        )
+                        for hit in exa_hits[: max_results * 2]
+                    ),
+                    return_exceptions=True,
+                )
+                for item in exa_results:
+                    if isinstance(item, BaseException) or item is None:
+                        continue
+                    dedupe_key, candidate = item
+                    if dedupe_key not in discovered_candidates:
+                        discovered_candidates[dedupe_key] = candidate
+                        if len(discovered_candidates) >= pool_limit:
+                            break
+
+        if settings.TAVILY_API_KEY and len(discovered_candidates) < pool_limit:
+            tavily_hits = await search_tavily_articles(
+                queries[0],
+                max_results=max_results * 2,
+                transport=transport,
+            )
+            if tavily_hits:
+                tavily_results = await asyncio.gather(
+                    *(
+                        _enrich_article_candidate(
+                            http,
+                            art_title=hit.title,
+                            art_link=hit.url,
+                            outlet=hit.outlet,
+                            author_name="",
+                            rss_email=None,
+                            summary=hit.content,
+                            source_url="https://api.tavily.com/search",
+                        )
+                        for hit in tavily_hits
+                    ),
+                    return_exceptions=True,
+                )
+                for item in tavily_results:
+                    if isinstance(item, BaseException) or item is None:
+                        continue
+                    dedupe_key, candidate = item
+                    if dedupe_key not in discovered_candidates:
+                        discovered_candidates[dedupe_key] = candidate
+                        if len(discovered_candidates) >= pool_limit:
+                            break
+
         for default_outlet, rss_url in feed_sources:
             if len(discovered_candidates) >= pool_limit:
                 break
@@ -192,120 +476,19 @@ async def discover_journalists_for_client(
                 continue
 
             feed = feedparser.parse(resp.text)
-            for entry in feed.entries[: max_results * 2]:
-                if len(discovered_candidates) >= pool_limit:
-                    break
-
-                art_title = str(getattr(entry, "title", "")).strip()
-                raw_link = str(getattr(entry, "link", "")).strip()
-                if not art_title or not raw_link:
+            entries = feed.entries[: max_results * 2]
+            results = await asyncio.gather(
+                *(_enrich_entry(http, default_outlet, rss_url, entry) for entry in entries),
+                return_exceptions=True,
+            )
+            for item in results:
+                if isinstance(item, BaseException) or item is None:
                     continue
-                art_link = _unwrap_news_link(raw_link)
-
-                source_meta = getattr(entry, "source", None)
-                outlet = str(
-                    getattr(source_meta, "title", "")
-                    or (default_outlet if default_outlet != "Bing News" else urlparse(art_link).netloc)
-                ).strip()
-                author_name = str(getattr(entry, "author", "")).strip()
-                rss_email = _extract_rss_email(entry)
-                summary = re.sub(r"<[^>]+>", " ", str(getattr(entry, "summary", ""))).strip()[:400]
-
-                # Enrich from article page (respecting robots.txt) for byline, email, and socials
-                enriched: ScrapedJournalist | None = None
-                try:
-                    clean_art_url = validate_public_http_url(art_link)
-                    art_domain = urlparse(clean_art_url).netloc.lower()
-                    await rate_limiter.acquire(art_domain)
-                    if await robots.can_fetch(http, clean_art_url):
-                        art_resp = await http.get(
-                            clean_art_url, headers={"User-Agent": settings.SCRAPER_USER_AGENT}
-                        )
-                        if art_resp.status_code == 200:
-                            byline = _extract_byline_from_html(art_resp.text)
-                            if byline:
-                                author_name = byline
-                            parsed_page = extract_journalist_from_html(
-                                art_resp.text,
-                                source_url=str(art_resp.url),
-                                outlet=outlet,
-                                beat=queries[0],
-                            )
-                            if author_name:
-                                parsed_page.canonical_name = author_name
-                            # Fallback to author profile page if article page has no email
-                            if parsed_page.email is None:
-                                author_url = _find_author_profile_url(art_resp.text, str(art_resp.url))
-                                if author_url:
-                                    try:
-                                        clean_auth_url = validate_public_http_url(author_url)
-                                        auth_domain = urlparse(clean_auth_url).netloc.lower()
-                                        await rate_limiter.acquire(auth_domain)
-                                        if await robots.can_fetch(http, clean_auth_url):
-                                            auth_resp = await http.get(
-                                                clean_auth_url,
-                                                headers={"User-Agent": settings.SCRAPER_USER_AGENT},
-                                            )
-                                            if auth_resp.status_code == 200:
-                                                auth_page = extract_journalist_from_html(
-                                                    auth_resp.text,
-                                                    source_url=str(auth_resp.url),
-                                                    outlet=outlet,
-                                                    beat=queries[0],
-                                                )
-                                                if auth_page.email:
-                                                    parsed_page.email = auth_page.email
-                                                    parsed_page.email_source_url = auth_page.email_source_url
-                                                    parsed_page.email_scraped_at = auth_page.email_scraped_at
-                                                if not parsed_page.socials and auth_page.socials:
-                                                    parsed_page.socials = auth_page.socials
-                                    except Exception:
-                                        pass
-                            enriched = parsed_page
-                except Exception:
-                    enriched = None
-
-                final_name = (
-                    author_name
-                    or (enriched.canonical_name if enriched else "")
-                ).strip()
-                if not _is_valid_journalist_name(final_name):
-                    continue
-
-                dedupe_key = f"{final_name.lower()}|{outlet.lower()}"
-                article_obj = ScrapedArticle(
-                    title=art_title,
-                    url=art_link,
-                    published_at=None,
-                    summary=summary,
-                    source_url=rss_url,
-                    scraped_at=now,
-                    content_hash=hashlib.sha256(f"{art_title}|{art_link}".encode()).hexdigest(),
-                )
-
+                dedupe_key, candidate = item
                 if dedupe_key not in discovered_candidates:
-                    if enriched is not None:
-                        if enriched.email is None and rss_email is not None:
-                            enriched.email = rss_email
-                            enriched.email_source_url = rss_url
-                            enriched.email_scraped_at = now
-                        if not any(a.url == art_link for a in enriched.articles):
-                            enriched.articles.insert(0, article_obj)
-                        discovered_candidates[dedupe_key] = enriched
-                    else:
-                        discovered_candidates[dedupe_key] = ScrapedJournalist(
-                            canonical_name=final_name,
-                            outlet=outlet,
-                            beat=queries[0],
-                            email=rss_email,
-                            email_source_url=rss_url if rss_email else None,
-                            email_scraped_at=now if rss_email else None,
-                            profile_source_url=art_link,
-                            profile_scraped_at=now,
-                            confidence_score=0.75 if rss_email else 0.6,
-                            socials=[],
-                            articles=[article_obj],
-                        )
+                    discovered_candidates[dedupe_key] = candidate
+                    if len(discovered_candidates) >= pool_limit:
+                        break
 
     ranked = sorted(
         discovered_candidates.values(),
