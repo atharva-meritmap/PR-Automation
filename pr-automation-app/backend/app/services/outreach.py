@@ -2,7 +2,7 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -10,6 +10,8 @@ from app.core.config import get_settings
 from app.db.models import Article, Client, EmailMessage, Journalist, Pitch, Suppression, User
 from app.services.decision import HeuristicDecisionClassifier
 from app.services.llm import generate_openrouter_pitch
+from app.services.mailer import MailDispatchError, dispatch_pitch_email
+from app.services.scraper import extract_article_markdown
 
 
 class OutreachGuardrailError(Exception):
@@ -60,6 +62,11 @@ async def generate_pitch_for_journalist(
     company = str(client.key_facts.get("company", "")).strip()
     role_line = f"{role} at {company}" if role and company else (role or company or client.industry)
     approved_facts = client.brand_voice.strip() or f"Expertise in {client.industry}."
+    article_context = article.summary.strip()
+    if len(article_context) < 160 and article.url:
+        extracted_md = await extract_article_markdown(article.url)
+        if extracted_md:
+            article_context = extracted_md
 
     llm_body = await generate_openrouter_pitch(
         client_name=client.name,
@@ -69,7 +76,7 @@ async def generate_pitch_for_journalist(
         target_title=article.title,
         target_publication=journalist.outlet,
         journalist_name=journalist.canonical_name,
-        target_summary=article.summary,
+        target_summary=article_context,
     )
     body = llm_body or _fallback_pitch_body(client, journalist, article)
     subject = f"Expert perspective on {client.industry}: {client.name} ({journalist.outlet} follow-up)"[:300]
@@ -140,14 +147,38 @@ async def approve_and_send_pitch(
             f"Blocked: journalist is within the {settings.JOURNALIST_COOLDOWN_DAYS}-day cooldown window."
         )
 
+    daily_cutoff = now - timedelta(hours=24)
+    daily_count_res = await db.execute(
+        select(func.count(EmailMessage.id)).where(
+            EmailMessage.direction == "outbound",
+            EmailMessage.sent_at >= daily_cutoff,
+        )
+    )
+    daily_sent = int(daily_count_res.scalar() or 0)
+    if daily_sent >= settings.MAX_DAILY_SENDS_PER_MAILBOX:
+        raise OutreachGuardrailError(
+            f"Blocked: daily mailbox cap of {settings.MAX_DAILY_SENDS_PER_MAILBOX} sends reached."
+        )
+
     is_dry_run = settings.MAIL_PROVIDER == "dry_run"
+    rfc_message_id = f"<{uuid.uuid4().hex}@pr-automation.local>"
+    try:
+        provider_message_id, delivery_status = await dispatch_pitch_email(
+            to_email=journalist.email,
+            subject=pitch.subject,
+            body=pitch.body,
+            rfc_message_id=rfc_message_id,
+        )
+    except MailDispatchError as exc:
+        raise OutreachGuardrailError(str(exc)) from exc
+
     msg = EmailMessage(
         pitch_id=pitch.id,
         direction="outbound",
         provider=settings.MAIL_PROVIDER,
-        provider_message_id=f"dryrun-{uuid.uuid4().hex[:12]}" if is_dry_run else None,
-        rfc_message_id=f"<{uuid.uuid4().hex}@pr-automation.local>",
-        status="sandboxed" if is_dry_run else "sent",
+        provider_message_id=provider_message_id,
+        rfc_message_id=rfc_message_id,
+        status=delivery_status,
         sent_at=now,
         raw_headers={"to": journalist.email, "subject": pitch.subject, "dry_run": is_dry_run},
         body_snippet=pitch.body[:400],

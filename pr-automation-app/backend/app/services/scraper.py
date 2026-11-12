@@ -434,3 +434,53 @@ async def scrape_journalist_page(
                             journalist.articles.append(art)
 
     return journalist
+
+
+async def extract_article_markdown(
+    url: str,
+    *,
+    max_chars: int = 2500,
+    allow_jina_fallback: bool = True,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> str:
+    """Extract clean readable text/markdown from an article URL (HTML first, r.jina.ai fallback)."""
+    settings = get_settings()
+    try:
+        clean_url = validate_public_http_url(url)
+    except Exception:
+        return ""
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            follow_redirects=True,
+            transport=transport,
+        ) as client:
+            status, _, html = await smart_fetch_html(
+                client,
+                clean_url,
+                user_agent=settings.SCRAPER_USER_AGENT,
+                allow_stealth_fallback=(transport is None),
+            )
+            if status == 200 and html:
+                sel = Selector(html)
+                blocks: list[str] = []
+                for tag in ("h1", "h2", "p"):
+                    for txt in sel.css(f"{tag}::text").getall():
+                        cleaned = re.sub(r"\s+", " ", str(txt)).strip()
+                        if len(cleaned) >= 25:
+                            blocks.append(f"## {cleaned}" if tag in ("h1", "h2") else cleaned)
+                extracted = "\n\n".join(blocks).strip()
+                if len(extracted) >= 120:
+                    return extracted[:max_chars]
+
+            if allow_jina_fallback:
+                jina_resp = await client.get(
+                    f"https://r.jina.ai/{clean_url}",
+                    headers={"User-Agent": settings.SCRAPER_USER_AGENT, "Accept": "text/plain"},
+                )
+                if jina_resp.status_code == 200 and jina_resp.text.strip():
+                    return jina_resp.text.strip()[:max_chars]
+    except Exception:
+        return ""
+    return ""

@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     MAIL_PROVIDER: Literal["dry_run", "gmail", "m365", "smtp", "resend"] = "dry_run"
     REQUIRE_VERIFIED_EMAIL: bool = True
 
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+    RESEND_API_KEY: str = ""
+    RESEND_FROM_EMAIL: str = ""
+    IMAP_HOST: str = ""
+    IMAP_PORT: int = 993
+    IMAP_USER: str = ""
+    IMAP_PASSWORD: str = ""
+
     DECISION_BACKEND: Literal["heuristic", "laya"] = "laya"
     LAYA_MODEL_ID: str = "convaiinnovations/laya"
     HF_HOME: str = ""

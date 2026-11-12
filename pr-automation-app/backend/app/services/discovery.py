@@ -35,14 +35,91 @@ from app.services.tavily_search import (
     search_tavily_bio,
 )
 
-# Public, high-signal publication RSS feeds for tech/AI/business/science PR discovery
+# Public, high-signal publication & trade RSS feeds for tech/AI/biotech/fintech/science PR discovery
 PUBLICATION_RSS_FEEDS: list[tuple[str, str]] = [
     ("TechCrunch", "https://techcrunch.com/feed/"),
     ("VentureBeat", "https://venturebeat.com/feed/"),
     ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
     ("Wired", "https://www.wired.com/feed/rss"),
     ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
+    ("IEEE Spectrum", "https://spectrum.ieee.org/feeds/feed.rss"),
+    ("Finextra", "https://www.finextra.com/rss/headlines.aspx"),
+    ("Fierce Biotech", "https://www.fiercebiotech.com/rss/xml"),
 ]
+
+
+async def fetch_bluesky_journalist_candidates(
+    http: httpx.AsyncClient,
+    topic_query: str,
+    *,
+    now: datetime,
+    limit: int = 8,
+) -> list[tuple[str, ScrapedJournalist]]:
+    """Discover writers/podcasters/reporters posting about the candidate's niche on Bluesky."""
+    try:
+        resp = await http.get(
+            "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts",
+            params={"q": f"{topic_query} journalist OR newsletter OR podcast", "limit": limit},
+        )
+        if resp.status_code != 200:
+            return []
+        posts = resp.json().get("posts") or []
+    except Exception:
+        return []
+
+    found: list[tuple[str, ScrapedJournalist]] = []
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        author = post.get("author") or {}
+        record = post.get("record") or {}
+        handle = str(author.get("handle") or "").strip()
+        display_name = str(author.get("displayName") or "").strip()
+        text = str(record.get("text") or "").strip()
+        if not handle or not _is_valid_journalist_name(display_name):
+            continue
+
+        profile_url = f"https://bsky.app/profile/{handle}"
+        email: str | None = None
+        for match in _EMAIL_RE.findall(text):
+            if _is_usable_email(match):
+                email = match.lower()
+                break
+
+        uri = str(post.get("uri") or "")
+        post_id = uri.rsplit("/", 1)[-1] if "/" in uri else "post"
+        post_url = f"{profile_url}/post/{post_id}"
+        article_obj = ScrapedArticle(
+            title=text[:140] or f"Bluesky post by {display_name}",
+            url=post_url,
+            published_at=None,
+            summary=text[:400],
+            source_url=profile_url,
+            scraped_at=now,
+            content_hash=hashlib.sha256(post_url.encode()).hexdigest(),
+        )
+        candidate = ScrapedJournalist(
+            canonical_name=display_name,
+            outlet="Bluesky",
+            beat=topic_query,
+            email=email,
+            email_source_url=post_url if email else None,
+            email_scraped_at=now if email else None,
+            profile_source_url=profile_url,
+            profile_scraped_at=now,
+            confidence_score=0.7 if email else 0.55,
+            socials=[
+                ScrapedSocial(
+                    platform="bluesky",
+                    handle_or_url=profile_url,
+                    source_url=profile_url,
+                    scraped_at=now,
+                )
+            ],
+            articles=[article_obj],
+        )
+        found.append((f"{display_name.lower()}|bluesky", candidate))
+    return found
 
 
 def build_discovery_queries(client: Client, topic_override: str = "") -> list[str]:
@@ -174,14 +251,27 @@ async def discover_journalists_for_client(
     discovered_candidates: dict[str, ScrapedJournalist] = {}
     now = datetime.now(timezone.utc)
 
-    # Combine major publication RSS feeds + Bing News topic RSS
-    feed_sources: list[tuple[str, str]] = PUBLICATION_RSS_FEEDS + [
-        (
-            "Bing News",
-            f"https://www.bing.com/news/search?q={quote_plus(q)}&format=rss",
-        )
-        for q in queries
-    ]
+    # Combine major publication/trade RSS feeds + Bing News + Substack/Podcast topic RSS
+    feed_sources: list[tuple[str, str]] = (
+        PUBLICATION_RSS_FEEDS
+        + [
+            (
+                "Bing News",
+                f"https://www.bing.com/news/search?q={quote_plus(q)}&format=rss",
+            )
+            for q in queries
+        ]
+        + [
+            (
+                "Substack",
+                f"https://www.bing.com/news/search?q={quote_plus(f'site:substack.com {queries[0]}')}&format=rss",
+            ),
+            (
+                "Podcast",
+                f"https://www.bing.com/news/search?q={quote_plus(f'{queries[0]} podcast interview')}&format=rss",
+            ),
+        ]
+    )
     pool_limit = max_results + 2
     allow_stealth = transport is None
     sem = asyncio.Semaphore(6)
@@ -485,6 +575,16 @@ async def discover_journalists_for_client(
                 if isinstance(item, BaseException) or item is None:
                     continue
                 dedupe_key, candidate = item
+                if dedupe_key not in discovered_candidates:
+                    discovered_candidates[dedupe_key] = candidate
+                    if len(discovered_candidates) >= pool_limit:
+                        break
+
+        if len(discovered_candidates) < pool_limit:
+            bsky_hits = await fetch_bluesky_journalist_candidates(
+                http, queries[0], now=now, limit=max_results
+            )
+            for dedupe_key, candidate in bsky_hits:
                 if dedupe_key not in discovered_candidates:
                     discovered_candidates[dedupe_key] = candidate
                     if len(discovered_candidates) >= pool_limit:
