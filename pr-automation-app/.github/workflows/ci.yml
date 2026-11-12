@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pr_user
+          POSTGRES_PASSWORD: pr_password
+          POSTGRES_DB: pr_automation
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check app tests
+      - run: mypy app
+      - name: Run Alembic migrations against Postgres
+        env:
+          DATABASE_URL: postgresql+asyncpg://pr_user:pr_password@localhost:5432/pr_automation
+        run: alembic upgrade head
+      - name: Run pytest
+        env:
+          DATABASE_URL: postgresql+asyncpg://pr_user:pr_password@localhost:5432/pr_automation
+        run: pytest -v
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci || npm install
+      - run: npx tsc --noEmit
+      - run: npm run build
+
