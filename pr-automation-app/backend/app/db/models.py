@@ -230,3 +230,28 @@ class PrOpportunity(Base, TimestampMixin):
     scraped_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class FollowUp(Base, TimestampMixin):
+    __tablename__ = "follow_ups"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("clients.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    officer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    journalist_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("journalists.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    pitch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("pitches.id", ondelete="SET NULL"), nullable=True
+    )
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    journalist: Mapped["Journalist"] = relationship()
+    pitch: Mapped["Pitch | None"] = relationship()
+
+

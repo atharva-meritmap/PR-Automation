@@ -163,4 +163,22 @@ export interface ReplyClassificationResult {
   detail: string;
 }
 
+export interface FollowUpItem {
+  id: string;
+  client_id: string;
+  officer_id: string;
+  journalist_id: string;
+  pitch_id: string | null;
+  journalist_name: string;
+  journalist_outlet: string;
+  journalist_email: string | null;
+  pitch_subject: string | null;
+  due_at: string;
+  status: string;
+  note: string;
+  is_overdue: boolean;
+  completed_at: string | null;
+  created_at: string;
+}
+
 

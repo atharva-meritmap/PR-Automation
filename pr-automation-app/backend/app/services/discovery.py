@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.db.models import Client, Journalist
-from app.services.email_verifier import resolve_journalist_email
+from app.services.email_verifier import resolve_journalist_email, verify_email_address
 from app.services.exa_search import (
     search_articles_with_authors,
     search_journalist_bio,
@@ -446,8 +446,15 @@ async def discover_journalists_for_client(
             )
             if verified_email and v_status == "verified":
                 candidate.email = verified_email
+                candidate.email_status = "verified"
                 candidate.email_source_url = f"{v_source}://{art_domain}"
                 candidate.email_scraped_at = now
+        elif candidate.email is not None and candidate.email_status == "unverified":
+            try:
+                verif = await verify_email_address(candidate.email, transport=transport)
+                candidate.email_status = verif.status
+            except Exception:
+                pass
 
         return dedupe_key, candidate
 

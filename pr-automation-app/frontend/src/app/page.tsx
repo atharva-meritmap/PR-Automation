@@ -5,6 +5,7 @@ import {
   apiFetch,
   ClientItem,
   CuratedJournalistMatch,
+  FollowUpItem,
   JournalistItem,
   PitchItem,
   PrOpportunityItem,
@@ -52,9 +53,13 @@ export default function HomePage() {
   const [selectedClientId, setSelectedClientId] = useState<string>("");
   const [curatedClient, setCuratedClient] = useState<ClientItem | null>(null);
   const [curatedMatches, setCuratedMatches] = useState<CuratedJournalistMatch[]>([]);
-  const [workspaceSubTab, setWorkspaceSubTab] = useState<"journalists" | "opportunities" | "pitches">("journalists");
+  const [workspaceSubTab, setWorkspaceSubTab] = useState<"journalists" | "opportunities" | "pitches" | "calendar">("journalists");
   const [opportunities, setOpportunities] = useState<PrOpportunityItem[]>([]);
   const [pitches, setPitches] = useState<PitchItem[]>([]);
+  const [followUps, setFollowUps] = useState<FollowUpItem[]>([]);
+  const [fuJournalistId, setFuJournalistId] = useState("");
+  const [fuDueAt, setFuDueAt] = useState("");
+  const [fuNote, setFuNote] = useState("");
   const [pitchSubjectEdits, setPitchSubjectEdits] = useState<Record<string, string>>({});
   const [pitchBodyEdits, setPitchBodyEdits] = useState<Record<string, string>>({});
   const [replyInputs, setReplyInputs] = useState<Record<string, string>>({});
@@ -318,7 +323,7 @@ export default function HomePage() {
     setBusy(true);
     try {
       const suffix = refreshScores ? "?refresh_scores=true" : "";
-      const [matches, opps, pit] = await Promise.all([
+      const [matches, opps, pit, fus] = await Promise.all([
         apiFetch<CuratedJournalistMatch[]>(
           `/api/v1/clients/${client.id}/curated-journalists${suffix}`,
           {},
@@ -326,10 +331,15 @@ export default function HomePage() {
         ),
         apiFetch<PrOpportunityItem[]>(`/api/v1/clients/${client.id}/opportunities`, {}, token),
         apiFetch<PitchItem[]>(`/api/v1/clients/${client.id}/pitches`, {}, token),
+        apiFetch<FollowUpItem[]>(`/api/v1/clients/${client.id}/follow-ups`, {}, token),
       ]);
       setCuratedMatches(matches);
       setOpportunities(opps);
       setPitches(pit);
+      setFollowUps(fus);
+      if (matches.length > 0 && !fuJournalistId) {
+        setFuJournalistId(matches[0].journalist_id);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to curate journalists");
     } finally {
@@ -477,6 +487,14 @@ export default function HomePage() {
         token,
       );
       setPitches((prev) => prev.map((p) => (p.id === pitchId ? updated : p)));
+      if (curatedClient) {
+        const fus = await apiFetch<FollowUpItem[]>(
+          `/api/v1/clients/${curatedClient.id}/follow-ups`,
+          {},
+          token,
+        );
+        setFollowUps(fus);
+      }
       setNotice("Saved pitch edits.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save pitch edits");
@@ -493,6 +511,14 @@ export default function HomePage() {
         token,
       );
       setPitches((prev) => prev.map((p) => (p.id === pitchId ? updated : p)));
+      if (curatedClient) {
+        const fus = await apiFetch<FollowUpItem[]>(
+          `/api/v1/clients/${curatedClient.id}/follow-ups`,
+          {},
+          token,
+        );
+        setFollowUps(fus);
+      }
       setNotice(`Pitch approved & dispatched (${updated.status}).`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to approve/send pitch");
@@ -517,6 +543,67 @@ export default function HomePage() {
       setNotice(res.detail);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to classify reply");
+    }
+  }
+
+  async function handleCreateFollowUp(useAiTiming: boolean) {
+    if (!token || !curatedClient || !fuJournalistId) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const payload: Record<string, unknown> = {
+        journalist_id: fuJournalistId,
+        note: fuNote.trim(),
+      };
+      if (!useAiTiming && fuDueAt) {
+        payload.due_at = new Date(fuDueAt).toISOString();
+      }
+      const created = await apiFetch<FollowUpItem>(
+        `/api/v1/clients/${curatedClient.id}/follow-ups`,
+        { method: "POST", body: JSON.stringify(payload) },
+        token,
+      );
+      setFollowUps((prev) =>
+        [...prev, created].sort((a, b) => a.due_at.localeCompare(b.due_at)),
+      );
+      setFuNote("");
+      setFuDueAt("");
+      setNotice(
+        useAiTiming
+          ? `AI scheduled follow-up for ${created.journalist_name} on ${new Date(created.due_at).toLocaleString()}.`
+          : `Scheduled follow-up for ${created.journalist_name}.`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to schedule follow-up");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUpdateFollowUp(
+    followUpId: string,
+    patch: { status?: "pending" | "completed" | "cancelled"; snooze_days?: number },
+  ) {
+    if (!token) return;
+    setError(null);
+    try {
+      const updated = await apiFetch<FollowUpItem>(
+        `/api/v1/follow-ups/${followUpId}`,
+        { method: "PATCH", body: JSON.stringify(patch) },
+        token,
+      );
+      setFollowUps((prev) =>
+        prev
+          .map((f) => (f.id === followUpId ? updated : f))
+          .sort((a, b) => a.due_at.localeCompare(b.due_at)),
+      );
+      setNotice(
+        patch.snooze_days
+          ? `Snoozed follow-up by ${patch.snooze_days} days.`
+          : `Updated follow-up status to ${updated.status}.`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update follow-up");
     }
   }
 
@@ -772,7 +859,176 @@ export default function HomePage() {
               >
                 Outreach &amp; Pitches ({pitches.length})
               </button>
+              <button
+                type="button"
+                onClick={() => setWorkspaceSubTab("calendar")}
+                className={`rounded-lg px-4 py-2 text-xs font-semibold transition ${
+                  workspaceSubTab === "calendar"
+                    ? "bg-blue-600 text-white"
+                    : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+                }`}
+              >
+                Follow-Up Calendar ({followUps.filter((f) => f.status === "pending").length})
+              </button>
             </div>
+
+            {workspaceSubTab === "calendar" && (
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-blue-100 bg-white p-6 shadow-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-base font-semibold text-slate-900">
+                        AI-Curated Follow-Up Calendar for {curatedClient.name}
+                      </h3>
+                      <p className="text-xs text-slate-500">
+                        Follow-ups are auto-scheduled when you send a pitch using AI-curated mid-week morning editorial windows for maximum reply probability.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 sm:grid-cols-4">
+                    <select
+                      value={fuJournalistId}
+                      onChange={(e) => setFuJournalistId(e.target.value)}
+                      className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-800"
+                    >
+                      <option value="">Select journalist...</option>
+                      {curatedMatches.map((m) => (
+                        <option key={m.journalist_id} value={m.journalist_id}>
+                          {m.canonical_name} ({m.outlet})
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="datetime-local"
+                      value={fuDueAt}
+                      onChange={(e) => setFuDueAt(e.target.value)}
+                      className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-800"
+                      title="Optional manual date/time (leave empty for AI Best Time)"
+                    />
+                    <input
+                      type="text"
+                      value={fuNote}
+                      onChange={(e) => setFuNote(e.target.value)}
+                      placeholder="Follow-up note (optional)"
+                      className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-800"
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        disabled={busy || !fuJournalistId}
+                        onClick={() => handleCreateFollowUp(true)}
+                        className="flex-1 rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        AI Best Time
+                      </button>
+                      {fuDueAt && (
+                        <button
+                          type="button"
+                          disabled={busy || !fuJournalistId}
+                          onClick={() => handleCreateFollowUp(false)}
+                          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                        >
+                          Manual
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                  <div className="space-y-3">
+                    {followUps.map((fu) => (
+                      <div
+                        key={fu.id}
+                        className={`rounded-xl border p-4 ${
+                          fu.is_overdue
+                            ? "border-red-300 bg-red-50/40"
+                            : fu.status === "pending"
+                              ? "border-blue-100 bg-slate-50/40"
+                              : "border-slate-200 bg-slate-50 opacity-75"
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-semibold text-slate-900">
+                                {fu.journalist_name}
+                              </span>
+                              <span className="text-xs text-slate-500">
+                                {fu.journalist_outlet}
+                              </span>
+                              {fu.is_overdue ? (
+                                <span className="rounded-full bg-red-100 px-2.5 py-0.5 text-[11px] font-semibold text-red-700">
+                                  Overdue
+                                </span>
+                              ) : (
+                                <span
+                                  className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
+                                    fu.status === "pending"
+                                      ? "bg-blue-100 text-blue-700"
+                                      : fu.status === "completed"
+                                        ? "bg-emerald-100 text-emerald-700"
+                                        : "bg-slate-200 text-slate-600"
+                                  }`}
+                                >
+                                  {fu.status}
+                                </span>
+                              )}
+                            </div>
+                            <p className="mt-1 text-xs font-medium text-slate-700">
+                              Due: {new Date(fu.due_at).toLocaleString()}
+                              {fu.journalist_email ? ` · ${fu.journalist_email}` : ""}
+                            </p>
+                            {fu.note && (
+                              <p className="mt-1 text-xs text-slate-600">{fu.note}</p>
+                            )}
+                          </div>
+
+                          {fu.status === "pending" && (
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleUpdateFollowUp(fu.id, { status: "completed" })
+                                }
+                                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                              >
+                                Mark Done
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleUpdateFollowUp(fu.id, { snooze_days: 3 })
+                                }
+                                className="rounded-lg border border-blue-200 bg-white px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50"
+                              >
+                                Snooze +3d
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleUpdateFollowUp(fu.id, { status: "cancelled" })
+                                }
+                                className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+
+                    {followUps.length === 0 && (
+                      <p className="py-8 text-center text-sm text-slate-500">
+                        No follow-ups scheduled for {curatedClient.name} yet. Send a pitch or click &quot;AI Best Time&quot; above.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
 
             {workspaceSubTab === "pitches" && (
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">

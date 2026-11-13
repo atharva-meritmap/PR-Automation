@@ -7,9 +7,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
-from app.db.models import Article, Client, EmailMessage, Journalist, Pitch, Suppression, User
+from app.db.models import (
+    Article,
+    Client,
+    EmailMessage,
+    FollowUp,
+    Journalist,
+    Pitch,
+    Suppression,
+    User,
+)
 from app.services.decision import HeuristicDecisionClassifier
-from app.services.llm import generate_openrouter_pitch
+from app.services.llm import curate_follow_up_timing, generate_openrouter_pitch
 from app.services.mailer import MailDispatchError, dispatch_pitch_email
 from app.services.scraper import extract_article_markdown
 
@@ -189,6 +198,35 @@ async def approve_and_send_pitch(
     pitch.approved_at = now
     pitch.status = "sent_dry_run" if is_dry_run else "sent"
     journalist.last_contacted_at = now
+
+    # Auto-schedule a follow-up reminder 5 days out if none is pending
+    existing_fu = await db.execute(
+        select(FollowUp).where(
+            FollowUp.client_id == pitch.client_id,
+            FollowUp.journalist_id == pitch.journalist_id,
+            FollowUp.status == "pending",
+        )
+    )
+    if existing_fu.scalar_one_or_none() is None:
+        curated_due, ai_reason = await curate_follow_up_timing(
+            journalist_name=journalist.canonical_name,
+            outlet=journalist.outlet,
+            beat=journalist.beat,
+            pitch_subject=pitch.subject,
+            now=now,
+        )
+        db.add(
+            FollowUp(
+                client_id=pitch.client_id,
+                officer_id=pitch.officer_id,
+                journalist_id=pitch.journalist_id,
+                pitch_id=pitch.id,
+                due_at=curated_due,
+                status="pending",
+                note=f"Follow up on pitch: {pitch.subject[:100]} — {ai_reason}",
+            )
+        )
+
     await db.flush()
     return msg
 
@@ -237,6 +275,19 @@ async def classify_and_record_reply(
         pitch.status = "opted_out"
     else:
         pitch.status = f"replied_{classification.intent}"
+
+    if classification.intent in ("opt_out", "accepted", "rejected"):
+        pending_fus = await db.execute(
+            select(FollowUp).where(
+                FollowUp.client_id == pitch.client_id,
+                FollowUp.journalist_id == pitch.journalist_id,
+                FollowUp.status == "pending",
+            )
+        )
+        new_fu_status = "completed" if classification.intent == "accepted" else "cancelled"
+        for fu in pending_fus.scalars().all():
+            fu.status = new_fu_status
+            fu.completed_at = now
 
     await db.flush()
     return classification.intent, round(classification.confidence, 4), suppressed

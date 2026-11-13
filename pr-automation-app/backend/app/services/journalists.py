@@ -38,7 +38,7 @@ async def upsert_scraped_journalist(
             outlet=scraped.outlet,
             beat=scraped.beat,
             email=scraped.email,
-            email_status="unverified" if scraped.email else "missing",
+            email_status=(scraped.email_status or "unverified") if scraped.email else "missing",
             email_source_url=scraped.email_source_url,
             email_scraped_at=scraped.email_scraped_at,
             profile_source_url=scraped.profile_source_url,
@@ -55,9 +55,11 @@ async def upsert_scraped_journalist(
             journalist.beat = scraped.beat
         if scraped.email and not journalist.email:
             journalist.email = scraped.email
-            journalist.email_status = "unverified"
+            journalist.email_status = scraped.email_status or "unverified"
             journalist.email_source_url = scraped.email_source_url
             journalist.email_scraped_at = scraped.email_scraped_at
+        elif scraped.email and journalist.email_status in ("unverified", "missing") and scraped.email_status == "verified":
+            journalist.email_status = "verified"
         journalist.profile_source_url = scraped.profile_source_url
         journalist.profile_scraped_at = scraped.profile_scraped_at
         journalist.confidence_score = max(journalist.confidence_score, scraped.confidence_score)

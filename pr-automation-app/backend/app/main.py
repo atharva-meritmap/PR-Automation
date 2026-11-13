@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.api.routes import auth, clients, journalists, opportunities, pitches, users
+from app.api.routes import auth, clients, follow_ups, journalists, opportunities, pitches, users
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.db.session import get_engine
@@ -76,6 +76,7 @@ def create_app() -> FastAPI:
     app.include_router(journalists.router)
     app.include_router(opportunities.router)
     app.include_router(pitches.router)
+    app.include_router(follow_ups.router)
 
     return app
 

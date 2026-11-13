@@ -140,6 +140,7 @@ class ScrapedJournalist:
     profile_source_url: str
     profile_scraped_at: datetime
     confidence_score: float
+    email_status: str = "unverified"
     socials: list[ScrapedSocial] = field(default_factory=list)
     articles: list[ScrapedArticle] = field(default_factory=list)
 
