@@ -12,6 +12,7 @@ from app.services.email_verifier import (
     find_email_prospeo,
     infer_outlet_email_candidates,
     resolve_journalist_email,
+    verify_email_address,
 )
 from app.services.scraper import smart_fetch_html
 
@@ -35,11 +36,41 @@ def test_infer_outlet_email_candidates() -> None:
 @pytest.mark.asyncio
 async def test_discover_verified_pattern_email_none_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EMAIL_VERIFIER_PROVIDER", "none")
+    monkeypatch.setenv("HUNTER_API_KEY", "")
+    monkeypatch.setenv("PROSPEO_API_KEY", "")
     get_settings.cache_clear()
     try:
         email, status = await discover_verified_pattern_email("Jane Doe", "techcrunch.com")
         assert email is None
         assert status == "missing"
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_verify_email_address_uses_hunter_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMAIL_VERIFIER_PROVIDER", "none")
+    monkeypatch.setenv("HUNTER_API_KEY", "hunter-key")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.hunter.io"
+        assert request.url.path == "/v2/email-verifier"
+        return httpx.Response(
+            200,
+            json={"data": {"status": "valid", "result": "deliverable"}},
+        )
+
+    try:
+        with patch("app.services.email_verifier.check_mx_record", return_value="mx.techcrunch.com"):
+            res = await verify_email_address(
+                "zack.whittaker@techcrunch.com",
+                transport=httpx.MockTransport(handler),
+            )
+        assert res.status == "verified"
+        assert "Hunter" in res.detail
     finally:
         get_settings.cache_clear()
 

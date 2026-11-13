@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     HUNTER_API_KEY: str = ""
     PROSPEO_API_KEY: str = ""
 
-    EMAIL_VERIFIER_PROVIDER: Literal["none", "reoon", "zerobounce"] = "none"
+    EMAIL_VERIFIER_PROVIDER: Literal["none", "reoon", "zerobounce", "hunter"] = "none"
     EMAIL_VERIFIER_API_KEY: str = ""
     SCRAPER_USER_AGENT: str = "PRAutomationBot/1.0 (+https://example.com/bot)"
 

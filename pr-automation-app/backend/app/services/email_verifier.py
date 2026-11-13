@@ -50,6 +50,10 @@ async def verify_email_address(
     provider = settings.EMAIL_VERIFIER_PROVIDER
     api_key = settings.EMAIL_VERIFIER_API_KEY
 
+    if (provider == "none" or not api_key) and settings.HUNTER_API_KEY:
+        provider = "hunter"
+        api_key = settings.HUNTER_API_KEY
+
     if provider == "none" or not api_key:
         # Without an external verifier, valid MX means 'unverified' (never 'verified')
         return EmailVerificationResult(
@@ -59,6 +63,20 @@ async def verify_email_address(
         )
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), transport=transport) as client:
+        if provider == "hunter":
+            resp = await client.get(
+                "https://api.hunter.io/v2/email-verifier",
+                params={"email": clean, "api_key": api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            verdict = str(data.get("status") or "").lower()
+            result = str(data.get("result") or "").lower()
+            if verdict == "valid" or result == "deliverable":
+                return EmailVerificationResult("verified", mx_host, f"Hunter: {verdict or result}")
+            if verdict in ("accept_all", "unknown", "webmail") or result == "risky":
+                return EmailVerificationResult("risky", mx_host, f"Hunter: {verdict or result}")
+            return EmailVerificationResult("invalid", mx_host, f"Hunter: {verdict or result}")
         if provider == "reoon":
             resp = await client.get(
                 "https://emailverifier.reoon.com/api/v1/verify",
